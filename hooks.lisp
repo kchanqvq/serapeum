@@ -41,6 +41,7 @@
    #:value
    ;; Hook class:
    #:hook
+   #:handlers-alist
    #:handlers
    #:disabled-handlers
    #:combination
@@ -170,17 +171,14 @@ their names are equal."
                   :initform t
                   :documentation "
 The class of the supported handlers.")
-   (handlers :initarg :handlers
-             :accessor handlers
-             :type list
-             :initform '()
-             :documentation "")
-   (disabled-handlers :initarg :disabled-handlers
-                      :accessor disabled-handlers
-                      :type list
-                      :initform '()
-                      :documentation "Those handlers are not run by `run-hook'.
-This is useful it the user wishes to disable some or all handlers without
+   (handlers-alist :initarg :handlers-alist
+                   :accessor handlers-alist
+                   :type list
+                   :initform '()
+                   :documentation "A list with elements of the form (HANDLER . ENABLE-P).
+
+`run-hook' only runs HANDLERs associated with non nil ENABLE-P.  This
+is useful it the user wishes to disable some or all handlers without
 removing them from the hook.")
    (combination :initarg :combination
                 :accessor combination
@@ -198,28 +196,36 @@ subclasses of `hook' and `handlers' with typed helper functions.
 The `add-hook' will thus only accept handlers of the right types.
 This implementation is good enough to catch typing errors at compile time."))
 
+(defmethod initialize-instance :after ((hook hook) &key handlers disabled-handlers &allow-other-keys)
+  (setf (handlers-alist hook)
+        (append (mapcar (alexandria:rcurry #'cons t) handlers)
+                (mapcar (alexandria:rcurry #'cons nil) disabled-handlers)
+                (handlers-alist hook))))
+
+(defmethod handlers ((hook hook)) (mapcar #'car (remove-if-not #'cdr (handlers-alist hook))))
+(defmethod disabled-handlers ((hook hook)) (mapcar #'car (remove-if #'cdr (handlers-alist hook))))
+
 (defmethod default-combine-hook ((hook hook) &rest args)
   "Return the list of the results of the HOOK handlers applied from youngest to
 oldest to ARGS.
 Return '() when there is no handler.
 This is an acceptable `combination' for `hook'."
-  (mapcar (lambda (handler)
-            (with-hook-restart (apply (fn handler) args)))
-          (handlers hook)))
+  (mapcar (lambda (handler-entry)
+            (when (cdr handler-entry)
+              (with-hook-restart (apply (fn (car handler-entry)) args))))
+          (handlers-alist hook)))
 
 (defmethod combine-hook-until-failure ((hook hook) &rest args)
   "Return the list of values until the first nil result.
 Handlers after the failing one are not run.
 
-You need to check if the hook has handlers to know if a NIL return value is due
-to the first handler failing or an empty hook.
-
 This is an acceptable `combination' for `hook'."
   (let ((result nil))
-    (loop for handler in (handlers hook)
-          for res = (apply (fn handler) args)
-          do (push res result)
-          always res)
+    (loop for (handler . enable-p) in (handlers-alist hook)
+          when enable-p
+            do (let ((res (apply (fn handler) args)))
+               (push res result)
+               (unless res (return))))
     (nreverse result)))
 
 (defmethod combine-hook-until-success ((hook hook) &rest args)
@@ -230,8 +236,8 @@ You need to check if the hook has handlers to know if a NIL return value is due
 to all handlers failing or an empty hook.
 
 This is an acceptable `combination' for `hook'."
-  (loop for handler in (handlers hook)
-          thereis (apply (fn handler) args)))
+  (loop for (handler . enable-p) in (handlers-alist hook)
+          thereis (and enable-p (apply (fn handler) args))))
 
 (defmethod combine-composed-hook ((hook hook) &rest args)
   "Return the result of the composition of the HOOK handlers on ARGS, from
@@ -250,11 +256,10 @@ Return HOOK.
 HANDLER is also not added if in the `disabled-handlers'.
 If APPEND is non-nil, HANDLER is added at the end."
   (serapeum:synchronized (hook)
-    (unless (or (member handler (handlers hook) :test #'equals)
-                (member handler (disabled-handlers hook) :test #'equals))
+    (unless (assoc handler (handlers-alist hook) :test #'equals)
       (if append
-          (alexandria:appendf (symbol-value hook) (list handler))
-          (pushnew handler (handlers hook) :test #'equals)))
+          (alexandria:appendf (symbol-value hook) (list (cons handler t)))
+          (push (cons handler t) (handlers-alist hook))))
     hook))
 
 (declaim (ftype (function ((or handler symbol) list) (or handler boolean)) find-handler))
@@ -262,39 +267,16 @@ If APPEND is non-nil, HANDLER is added at the end."
   "Return handler matching HANDLER-OR-NAME in HANDLERS sequence."
   (find handler-or-name handlers :test #'equals))
 
-(defun delete* (item sequence
-                &key from-end (test #'eql) (start 0)
-                     end count key)
-  "Like `delete' but return (values NEW-SEQUENCE FOUNDP)
-with FOUNDP being T if the element was found, NIL otherwise."
-  (let* ((foundp nil)
-         (new-sequence (delete-if (lambda (f)
-                                    (when (funcall test item f)
-                                      (setf foundp t)
-                                      t))
-                                  sequence
-                                  :from-end from-end
-                                  :start start
-                                  :key key
-                                  :end end
-                                  :count count)))
-    (values new-sequence foundp)))
-
 (defmethod remove-hook ((hook hook) handler-or-name)
-  "Remove handler matching HANDLER-OR-NAME from the handlers or the
-disabled-handlers in HOOK.
-HANDLER-OR-NAME is either a handler object or a symbol.
-Return HOOK's handlers."
+  "Remove handler entry matching HANDLER-OR-NAME from handlers-alist in HOOK.
+HANDLER-OR-NAME is either a handler object or a symbol.  Return HOOK's
+handlers-alist."
   (serapeum:synchronized (hook)
-    (multiple-value-bind (new-sequence foundp)
-        (delete* handler-or-name (handlers hook) :test #'equals)
-      (if foundp
-          (setf (handlers hook) new-sequence)
-          (multiple-value-bind (new-sequence foundp)
-              (delete* handler-or-name (disabled-handlers hook) :test #'equals)
-            (when foundp
-              (setf (disabled-handlers hook) new-sequence)))))
-    (handlers hook)))
+    (let ((handler-entry (assoc handler-or-name (handlers-alist hook) :test #'equals)))
+      (when handler-entry
+        (setf (handlers-alist hook)
+              (delete handler-entry (handlers-alist hook)))))
+    (handlers-alist hook)))
 
 (defmethod run-hook ((hook hook) &rest args)
   (apply (combination hook) hook args))
@@ -323,14 +305,22 @@ Return HOOK's handlers."
       (setf (slot-value hook source-handlers-slot) handlers-to-keep))))
 
 (defmethod disable-hook ((hook hook) &rest handlers)
-  "Prepend HANDLERS to the list of disabled handlers.
+  "Disable HANDLERS.
 Without HANDLERS, disable all of them."
-  (move-hook-handlers hook 'handlers 'disabled-handlers handlers))
+  (serapeum:synchronized (hook)
+    (dolist (handler-entry (handlers-alist hook))
+      (when (or (not handlers)
+                (member (car handler-entry) handlers :test #'equals))
+        (rplacd handler-entry nil)))))
 
 (defmethod enable-hook ((hook hook) &rest handlers)
-  "Prepend HANDLERS to the list of HOOK's handlers.
+  "Enable HANDLERS.
 Without HANDLERS, enable all of them."
-  (move-hook-handlers hook 'disabled-handlers 'handlers handlers))
+  (serapeum:synchronized (hook)
+    (dolist (handler-entry (handlers-alist hook))
+      (when (or (not handlers)
+                (member (car handler-entry) handlers :test #'equals))
+        (rplacd handler-entry t)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Global hooks.
