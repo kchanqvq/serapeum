@@ -398,6 +398,10 @@ HANDLER must be of type ~a."
                   hook-class-name
                   handler-class-name)
          (add-hook-internal hook handler :append append))
+       (defmethod add-hook ((hook ,hook-class-name) (f symbol) &key append)
+         ;; abuse MAKE-HANDLER-* to do type check!
+         (,function-name (symbol-function f))
+         (add-hook-internal hook f :append append))
        (defun ,hook-function-name (&key handlers (combination #'default-combine-hook explicit?))
          ,(format nil "Make hook and return it.
 HANDLERS can also contain named functions.
