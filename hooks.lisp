@@ -156,6 +156,14 @@ their names are equal."
      (eq (name fn1)
          (name fn2)))))
 
+(defmethod equals ((fn handler) obj) (eq (name fn) obj))
+(defmethod equals (obj (fn handler)) (eq (name fn) obj))
+(defmethod equals (obj1 obj2) (eq obj1 obj2))
+
+(defmethod name ((symbol symbol)) symbol)
+(defmethod fn ((symbol symbol)) (symbol-function symbol))
+(defmethod description ((symbol symbol)) (documentation symbol 'function))
+
 (defclass hook ()
   ((handler-class :reader handler-class ; TODO: Is this really needed?
                   :type symbol
@@ -176,7 +184,7 @@ This is useful it the user wishes to disable some or all handlers without
 removing them from the hook.")
    (combination :initarg :combination
                 :accessor combination
-                :type function
+                :type (or symbol function)
                 :initform #'default-combine-hook
                 :documentation "
 This can be used to reverse the execution order, return a single value, etc."))
@@ -252,10 +260,7 @@ If APPEND is non-nil, HANDLER is added at the end."
 (declaim (ftype (function ((or handler symbol) list) (or handler boolean)) find-handler))
 (defun find-handler (handler-or-name handlers)
   "Return handler matching HANDLER-OR-NAME in HANDLERS sequence."
-  (apply #'find handler-or-name handlers
-         (if (typep handler-or-name 'handler)
-             (list :test #'equals)
-             (list :key #'name))))
+  (find handler-or-name handlers :test #'equals))
 
 (defun delete* (item sequence
                 &key from-end (test #'eql) (start 0)
@@ -282,17 +287,11 @@ HANDLER-OR-NAME is either a handler object or a symbol.
 Return HOOK's handlers."
   (serapeum:synchronized (hook)
     (multiple-value-bind (new-sequence foundp)
-        (apply #'delete* handler-or-name (handlers hook)
-               (if (typep handler-or-name 'handler)
-                   (list :test #'equals)
-                   (list :key #'name)))
+        (delete* handler-or-name (handlers hook) :test #'equals)
       (if foundp
           (setf (handlers hook) new-sequence)
           (multiple-value-bind (new-sequence foundp)
-              (apply #'delete* handler-or-name (disabled-handlers hook)
-                     (if (typep handler-or-name 'handler)
-                         (list :test #'equals)
-                         (list :key #'name)))
+              (delete* handler-or-name (disabled-handlers hook) :test #'equals)
             (when foundp
               (setf (disabled-handlers hook) new-sequence)))))
     (handlers hook)))
@@ -315,10 +314,7 @@ Return HOOK's handlers."
     (let* ((handlers-to-move (if select-handlers
                                  (intersection (slot-value hook source-handlers-slot)
                                                select-handlers
-                                               :test (lambda (e1 e2)
-                                                       (if (typep e2 'handler)
-                                                           (equals e1 e2)
-                                                           (eq (name e1) e2))))
+                                               :test #'equals)
                                  (slot-value hook source-handlers-slot)))
            (handlers-to-keep (set-difference (slot-value hook source-handlers-slot)
                                              handlers-to-move)))
@@ -417,12 +413,15 @@ HANDLER must be of type ~a."
 HANDLERS can also contain named functions.
 Those will automatically be encapsulated with ~a." function-name)
          (when (and explicit?
-                    (not (functionp combination)))
-           (error "Function combination required."))
+                    (not (or (functionp combination) (symbolp combination))))
+           (error "Function or symbol combination required."))
          (make-instance ',hook-class-name
-                        :handlers (mapcar (lambda (f) (if (typep f 'handler)
-                                                          f
-                                                          (,function-name f)))
+                        :handlers (mapcar (lambda (f) (typecase f
+                                                        (handler f)
+                                                        (symbol
+                                                         ;; abuse MAKE-HANDLER-* to do type check!
+                                                         (,function-name (symbol-function f)) f)
+                                                        (function (,function-name f))))
                                           handlers)
                         :combination combination)))))
 
