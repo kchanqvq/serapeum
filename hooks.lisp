@@ -2,7 +2,6 @@
   (:use :common-lisp)
   (:import-from :serapeum
                 #:*hook*
-                #:with-hook-restart
                 #:add-hook
                 #:remove-hook
                 #:run-hooks
@@ -20,7 +19,6 @@
    #:run-hook
    #:run-hook-with-args-until-failure
    #:run-hook-with-args-until-success
-   ;; #:make-handler ; Leave unexported to incite using typed handlers.
    #:default-combine-hook
    #:combine-hook-until-failure
    #:combine-hook-until-success
@@ -46,19 +44,15 @@
    #:disabled-handlers
    #:combination
    ;; Pre-generated types:
-   #:make-handler-void
    #:handler-void
    #:hook-void
    #:make-hook-void
-   #:make-handler-string->string
    #:handler-string->string
    #:hook-string->string
    #:make-hook-string->string
-   #:make-handler-number->number
    #:handler-number->number
    #:hook-number->number
    #:make-hook-number->number
-   #:make-handler-any
    #:handler-any
    #:hook-any
    #:make-hook-any))
@@ -116,26 +110,34 @@ They serve two purposes as opposed to regular functions:
 
 With this extra information, it's possible to compare handlers and, in particular, avoid duplicates in hooks."))
 
-(defun make-handler (fn &key (class-name 'handler) name handler-type place value)
-  "Return a `handler'.
-NAME is only mandatory if FN is a lambda.
-CLASS-NAME can be used to create handler subclasses.
+(defun probe-ftype (function ftype)
+  "Invoke compiler to probe the type of FUNCTION.
 
-HANDLER-TYPE, PLACE and VALUE are as per the sltos in `handler-type'.
+If type of FUNCTION contradicts with FTYPE, raise an error.
 
-This function should not be used directly.
-Prefer the typed make-handler-* functions instead."
-  (setf name (or name (let ((fname (nth-value 2 (function-lambda-expression fn))))
-                        (when (typep fname 'symbol)
-                          fname))))
-  (unless name
-    (error "Can't make a handler without a name"))
-  (make-instance class-name
-                 :name name
-                 :fn fn
-                 :handler-type handler-type
-                 :place place
-                 :value value))
+If FTYPE is nil, nothing is done."
+  (when ftype
+    (handler-case
+        (let ((*error-output* (make-broadcast-stream))) ;; silence!
+          (compile nil
+                   `(lambda ()
+                      (let ((fn ,function))
+                        (declare (type ,ftype fn))
+                        fn))))
+      (style-warning (c)
+        (error "Handler function ~a does not match expected type ~a.
+Detail: ~a" function ftype c))))
+  (values))
+
+(defmethod initialize-instance :after ((handler handler) &key &allow-other-keys)
+  (with-slots (name fn handler-type) handler
+    (setf name (or name (let ((fname (nth-value 2 (function-lambda-expression fn))))
+                          (when (typep fname 'symbol)
+                            fname))))
+    (unless name
+      (error "Can't make a handler without a name"))
+    (with-simple-restart (reckless-continue "Create this handler nonetheless.")
+      (probe-ftype fn handler-type))))
 
 (defmethod equals ((fn1 handler) (fn2 handler))
   "Return non-nil if FN1 and FN2 are equal.
@@ -205,14 +207,24 @@ This implementation is good enough to catch typing errors at compile time."))
 (defmethod handlers ((hook hook)) (mapcar #'car (remove-if-not #'cdr (handlers-alist hook))))
 (defmethod disabled-handlers ((hook hook)) (mapcar #'car (remove-if #'cdr (handlers-alist hook))))
 
+(defmacro with-hook-restart ((hook handler) &body body)
+  `(restart-case
+       (serapeum:with-hook-restart ,@body)
+     (disable-handler ()
+       :report
+       (lambda (stream)
+         (format stream "Disable handler ~a which causes the error." ,handler))
+       (disable-hook ,hook ,handler))))
+
 (defmethod default-combine-hook ((hook hook) &rest args)
   "Return the list of the results of the HOOK handlers applied from youngest to
 oldest to ARGS.
 Return '() when there is no handler.
 This is an acceptable `combination' for `hook'."
-  (mapcar (lambda (handler-entry)
+  (mapcan (lambda (handler-entry)
             (when (cdr handler-entry)
-              (with-hook-restart (apply (fn (car handler-entry)) args))))
+              (with-hook-restart (hook (car handler-entry))
+                (list (apply (fn (car handler-entry)) args)))))
           (handlers-alist hook)))
 
 (defmethod combine-hook-until-failure ((hook hook) &rest args)
@@ -223,7 +235,8 @@ This is an acceptable `combination' for `hook'."
   (let ((result nil))
     (loop for (handler . enable-p) in (handlers-alist hook)
           when enable-p
-            do (let ((res (apply (fn handler) args)))
+            do (let ((res (with-hook-restart (hook handler)
+                            (apply (fn handler) args))))
                (push res result)
                (unless res (return))))
     (nreverse result)))
@@ -237,17 +250,23 @@ to all handlers failing or an empty hook.
 
 This is an acceptable `combination' for `hook'."
   (loop for (handler . enable-p) in (handlers-alist hook)
-          thereis (and enable-p (apply (fn handler) args))))
+          thereis (and enable-p
+                       (with-hook-restart (hook handler)
+                         (apply (fn handler) args)))))
 
 (defmethod combine-composed-hook ((hook hook) &rest args)
   "Return the result of the composition of the HOOK handlers on ARGS, from
 oldest to youngest.
 Without handler, return ARGS as values.
 This is an acceptable `combination' for `hook'."
-  (let ((fn-list (mapcar #'fn (handlers hook))))
-    (if fn-list
-        (apply (apply #'alexandria:compose fn-list) args)
-        (values-list args))))
+  (let ((result args)
+        (reversed-alist (reverse (handlers-alist hook))))
+    (declare (dynamic-extent reversed-alist))
+    (loop for (handler . enable-p) in reversed-alist
+          when enable-p
+            do (with-hook-restart (hook handler)
+                 (setf result (multiple-value-list (apply (fn handler) result)))))
+    (values-list result)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (defun add-hook-internal (hook handler &key append)
@@ -358,7 +377,6 @@ The following examples return different hooks:
 ;; hook would allow.  We work around this issue with a macro:
 ;;
 ;; - Generates hook and handler subclasses.
-;; - Generate a handler maker and declaim provided function type.
 ;; - Generate a `add-hook' defmethod against those 2 classes.
 
 (defmacro define-hook-type (name type)
@@ -367,28 +385,19 @@ Type must be something like:
 
   (function (string) (values integer t))
 
-A function with name make-handler-NAME will be created.
 A class with name handler-NAME will be created.
 The method `add-hook' is added for the new hook and handler types.
 
 The function make-hook-NAME is created.  It is similar to (make-instance
 'hook-NAME ...) except that named functions are also accepted.  Named functions
-will be automatically encapsulated with make-handler-NAME."
+will be automatically encapsulated with handler objects."
   (let* ((name (string name))
-         (function-name (intern (serapeum:concat "MAKE-HANDLER-" name)))
          (handler-class-name (intern (serapeum:concat "HANDLER-" name)))
          (hook-class-name (intern (serapeum:concat "HOOK-" name)))
          (hook-function-name (intern (serapeum:concat "MAKE-HOOK-" name))))
     `(progn
-       (defclass ,handler-class-name (handler) ())
-       (declaim (ftype (function (,type &key (:name symbol) (:place t) (:value t)))
-                       ,function-name))
-       (defun ,function-name (fn &key name place value)
-         (make-handler fn :class-name ',handler-class-name
-                          :name name
-                          :handler-type ',type
-                          :place place
-                          :value value))
+       (defclass ,handler-class-name (handler)
+         ((handler-type :initform ',type)))
        (defclass ,hook-class-name (hook)
          ((handler-class :initform ',handler-class-name)))
        (defmethod add-hook ((hook ,hook-class-name) (handler ,handler-class-name) &key append)
@@ -399,23 +408,31 @@ HANDLER must be of type ~a."
                   handler-class-name)
          (add-hook-internal hook handler :append append))
        (defmethod add-hook ((hook ,hook-class-name) (f symbol) &key append)
-         ;; abuse MAKE-HANDLER-* to do type check!
-         (,function-name (symbol-function f))
-         (add-hook-internal hook f :append append))
+         (with-simple-restart (skip "Do not add this handler.")
+           (with-simple-restart (reckless-continue "Add this handler nonetheless.")
+             (probe-ftype (symbol-function f) ',type))
+           (add-hook-internal hook f :append append))
+         hook)
        (defun ,hook-function-name (&key handlers (combination #'default-combine-hook explicit?))
          ,(format nil "Make hook and return it.
 HANDLERS can also contain named functions.
-Those will automatically be encapsulated with ~a." function-name)
+Those will automatically be encapsulated with ~a object." handler-class-name)
          (when (and explicit?
                     (not (or (functionp combination) (symbolp combination))))
            (error "Function or symbol combination required."))
          (make-instance ',hook-class-name
-                        :handlers (mapcar (lambda (f) (typecase f
-                                                        (handler f)
-                                                        (symbol
-                                                         ;; abuse MAKE-HANDLER-* to do type check!
-                                                         (,function-name (symbol-function f)) f)
-                                                        (function (,function-name f))))
+                        :handlers (mapcan (lambda (f)
+                                            (with-simple-restart (skip "Do not add this handler.")
+                                              (typecase f
+                                                (handler (list f))
+                                                (symbol
+                                                 (with-simple-restart
+                                                     (reckless-continue "Add this handler nonetheless.")
+                                                   (probe-ftype (symbol-function f) ',type))
+                                                 (list f))
+                                                (function
+                                                 (list
+                                                  (make-instance ',handler-class-name :fn f))))))
                                           handlers)
                         :combination combination)))))
 
