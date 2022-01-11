@@ -34,28 +34,20 @@
    #:name
    #:fn
    #:description
-   #:handler-type
    #:place
    #:value
    ;; Hook class:
    #:hook
+   #:handler-type
    #:handlers-alist
    #:handlers
    #:disabled-handlers
    #:combination
    ;; Pre-generated types:
-   #:handler-void
    #:hook-void
-   #:make-hook-void
-   #:handler-string->string
    #:hook-string->string
-   #:make-hook-string->string
-   #:handler-number->number
    #:hook-number->number
-   #:make-hook-number->number
-   #:handler-any
-   #:hook-any
-   #:make-hook-any))
+   #:hook-any))
 (in-package :serapeum/contrib/hooks)
 
 (defclass handler ()
@@ -79,12 +71,6 @@ Description of the handler.  This is purely informative.")
      :initform (required-argument 'fn)
      :documentation "
 The handler function.  It can be an anonymous function.")
-   (handler-type :initarg :handler-type
-                 :accessor handler-type
-                 :type t
-                 :initform nil
-                 :documentation "The function type of FN.
-This is purely informative.")
    (place :initarg :place
           :accessor place
           :type (or symbol list)
@@ -135,9 +121,7 @@ Detail: ~a" function ftype c))))
                           (when (typep fname 'symbol)
                             fname))))
     (unless name
-      (error "Can't make a handler without a name"))
-    (with-simple-restart (reckless-continue "Create this handler nonetheless.")
-      (probe-ftype fn handler-type))))
+      (error "Can't make a handler without a name"))))
 
 (defmethod equals ((fn1 handler) (fn2 handler))
   "Return non-nil if FN1 and FN2 are equal.
@@ -168,11 +152,11 @@ their names are equal."
 (defmethod description ((symbol symbol)) (documentation symbol 'function))
 
 (defclass hook ()
-  ((handler-class :reader handler-class ; TODO: Is this really needed?
-                  :type symbol
-                  :initform t
-                  :documentation "
-The class of the supported handlers.")
+  ((handler-type :initarg :handler-type
+                 :accessor handler-type
+                 :initform nil
+                 :documentation
+                 "The exptected function type of handlers.")
    (handlers-alist :initarg :handlers-alist
                    :accessor handlers-alist
                    :type list
@@ -191,18 +175,19 @@ This can be used to reverse the execution order, return a single value, etc."))
   (:documentation "This hook class serves as support for typed-hook.
 
 Typing in hook is crucial to guarantee that a hook is well formed, i.e. that
-it's handlers accept the right argument types and return the right value types.
-
-Because typing is too limited in Common Lisp, we leverage CLOS to generate
-subclasses of `hook' and `handlers' with typed helper functions.
-The `add-hook' will thus only accept handlers of the right types.
-This implementation is good enough to catch typing errors at compile time."))
+it's handlers accept the right argument types and return the right value types."))
 
 (defmethod initialize-instance :after ((hook hook) &key handlers disabled-handlers &allow-other-keys)
   (setf (handlers-alist hook)
         (append (mapcar (alexandria:rcurry #'cons t) handlers)
                 (mapcar (alexandria:rcurry #'cons nil) disabled-handlers)
-                (handlers-alist hook))))
+                (handlers-alist hook)))
+  (dolist (handler (mapcar #'car (handlers-alist hook)))
+    (restart-case
+        (probe-ftype (fn handler) (handler-type hook))
+      (remove-handler () :report "Remove this handler."
+        (remove-hook hook handler))
+      (reckless-continue () :report "Retain this handler nonetheless."))))
 
 (defmethod handlers ((hook hook)) (mapcar #'car (remove-if-not #'cdr (handlers-alist hook))))
 (defmethod disabled-handlers ((hook hook)) (mapcar #'car (remove-if #'cdr (handlers-alist hook))))
@@ -370,71 +355,24 @@ The following examples return different hooks:
 - (find-hook 'foo-hook (make-instance 'bar-class))"
   (gethash (list name object) %hook-table))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Compile-time type checking for add-hook is useful in case `add-hook' is not
-;; run when the user config is loaded.  Sadly Common Lisp does not seem to allow
-;; to extract the type of a function so that it can be checked against what a
-;; hook would allow.  We work around this issue with a macro:
-;;
-;; - Generates hook and handler subclasses.
-;; - Generate a `add-hook' defmethod against those 2 classes.
+(defmethod add-hook ((hook hook) handler &key append)
+  "Add HANDLER to HOOK.  Return HOOK.
+Check HANDLER's type according to `handler-type' slot of HOOK."
+  (with-simple-restart (skip "Do not add this handler.")
+    (with-simple-restart (reckless-continue "Add this handler nonetheless.")
+      (probe-ftype (symbol-function (fn handler)) (handler-type hook)))
+    (add-hook-internal hook handler :append append)))
 
 (defmacro define-hook-type (name type)
-  "Define hook class and constructor and the associated handler class.
+  "Define hook class.
 Type must be something like:
 
   (function (string) (values integer t))
-
-A class with name handler-NAME will be created.
-The method `add-hook' is added for the new hook and handler types.
-
-The function make-hook-NAME is created.  It is similar to (make-instance
-'hook-NAME ...) except that named functions are also accepted.  Named functions
-will be automatically encapsulated with handler objects."
+"
   (let* ((name (string name))
-         (handler-class-name (intern (serapeum:concat "HANDLER-" name)))
-         (hook-class-name (intern (serapeum:concat "HOOK-" name)))
-         (hook-function-name (intern (serapeum:concat "MAKE-HOOK-" name))))
-    `(progn
-       (defclass ,handler-class-name (handler)
-         ((handler-type :initform ',type)))
-       (defclass ,hook-class-name (hook)
-         ((handler-class :initform ',handler-class-name)))
-       (defmethod add-hook ((hook ,hook-class-name) (handler ,handler-class-name) &key append)
-         ,(format nil "Add HANDLER to HOOK.  Return HOOK.
-HOOK must be of type ~a
-HANDLER must be of type ~a."
-                  hook-class-name
-                  handler-class-name)
-         (add-hook-internal hook handler :append append))
-       (defmethod add-hook ((hook ,hook-class-name) (f symbol) &key append)
-         (with-simple-restart (skip "Do not add this handler.")
-           (with-simple-restart (reckless-continue "Add this handler nonetheless.")
-             (probe-ftype (symbol-function f) ',type))
-           (add-hook-internal hook f :append append))
-         hook)
-       (defun ,hook-function-name (&key handlers (combination #'default-combine-hook explicit?))
-         ,(format nil "Make hook and return it.
-HANDLERS can also contain named functions.
-Those will automatically be encapsulated with ~a object." handler-class-name)
-         (when (and explicit?
-                    (not (or (functionp combination) (symbolp combination))))
-           (error "Function or symbol combination required."))
-         (make-instance ',hook-class-name
-                        :handlers (mapcan (lambda (f)
-                                            (with-simple-restart (skip "Do not add this handler.")
-                                              (typecase f
-                                                (handler (list f))
-                                                (symbol
-                                                 (with-simple-restart
-                                                     (reckless-continue "Add this handler nonetheless.")
-                                                   (probe-ftype (symbol-function f) ',type))
-                                                 (list f))
-                                                (function
-                                                 (list
-                                                  (make-instance ',handler-class-name :fn f))))))
-                                          handlers)
-                        :combination combination)))))
+         (hook-class-name (intern (serapeum:concat "HOOK-" name))))
+    `(defclass ,hook-class-name (hook)
+       ((handler-type :initform ',type)))))
 
 ;; TODO: Allow listing all the hooks?
 
